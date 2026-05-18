@@ -172,10 +172,12 @@ func encodeIndexEntry(w *bufio.Writer, ie indexEntry) (int, error) {
 // Reader reads a finished SSTable. The index is parsed into memory on Open;
 // the file is kept open for ReadAt-based record fetches.
 type Reader struct {
-	f       *os.File
-	path    string
-	index   []indexEntry
-	dataLen uint64
+	f        *os.File
+	path     string
+	index    []indexEntry
+	dataLen  uint64
+	smallest []byte
+	largest  []byte
 }
 
 func Open(path string) (*Reader, error) {
@@ -229,11 +231,44 @@ func Open(path string) (*Reader, error) {
 		p = p[8:]
 		index = append(index, indexEntry{key: key, offset: off})
 	}
-	return &Reader{f: f, path: path, index: index, dataLen: indexOffset}, nil
+	r := &Reader{f: f, path: path, index: index, dataLen: indexOffset}
+	if len(index) > 0 {
+		r.smallest = index[0].key
+		last, err := r.findLargestKey()
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("sstable: %s: %w", path, err)
+		}
+		r.largest = last
+	}
+	return r, nil
 }
 
 func (r *Reader) Close() error { return r.f.Close() }
 func (r *Reader) Path() string { return r.path }
+
+// SmallestKey returns the first key in the SSTable, or nil if empty.
+func (r *Reader) SmallestKey() []byte { return r.smallest }
+
+// LargestKey returns the last key in the SSTable, or nil if empty.
+func (r *Reader) LargestKey() []byte { return r.largest }
+
+func (r *Reader) findLargestKey() ([]byte, error) {
+	last := r.index[len(r.index)-1]
+	sr := io.NewSectionReader(r.f, int64(last.offset), int64(r.dataLen-last.offset))
+	br := bufio.NewReader(sr)
+	var key []byte
+	for {
+		e, err := decodeRecord(br)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return key, nil
+			}
+			return nil, err
+		}
+		key = e.Key
+	}
+}
 
 // Get returns the entry for key. The bool reports whether key was present
 // (a tombstone hit returns true with kind == KindDelete; callers translate

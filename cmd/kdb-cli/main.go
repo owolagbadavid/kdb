@@ -113,7 +113,11 @@ func repl(db *kdb.DB, in io.Reader, out io.Writer) error {
 			if len(s.SSTables) == 0 {
 				fmt.Fprintln(out, "sstables: 0")
 			} else {
-				fmt.Fprintf(out, "sstables: %d (%s)\n", len(s.SSTables), strings.Join(s.SSTables, ", "))
+				names := make([]string, 0, len(s.SSTables))
+				for _, t := range s.SSTables {
+					names = append(names, fmt.Sprintf("%06d.sst@T%d", t.FileNum, t.Tier))
+				}
+				fmt.Fprintf(out, "sstables: %d (%s)\n", len(s.SSTables), strings.Join(names, ", "))
 			}
 		case "help":
 			fmt.Fprintln(out, "commands:")

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/owolagbadavid/kdb"
@@ -245,5 +247,173 @@ func TestFlushNewerValueShadowsOlder(t *testing.T) {
 	}
 	if !bytes.Equal(got, []byte("new")) {
 		t.Fatalf("after reopen: got %q, want new", got)
+	}
+}
+
+// TestCompactionShrinksSSTables: with a trigger of 4, several flushes
+// should collapse into fewer files than the number of flushes performed.
+func TestCompactionShrinksSSTables(t *testing.T) {
+	dir := t.TempDir()
+	opts := &kdb.Options{MemtableSizeBytes: 1, CompactionTrigger: 4}
+
+	db, _ := kdb.Open(dir, opts)
+	const n = 20
+	for i := 0; i < n; i++ {
+		k := []byte(fmt.Sprintf("k%02d", i))
+		_ = db.Put(k, []byte(fmt.Sprintf("v%d", i)))
+	}
+	s := db.Stats()
+	if len(s.SSTables) >= n {
+		t.Fatalf("expected compaction to shrink %d flushes; still have %d sstables", n, len(s.SSTables))
+	}
+	for i := 0; i < n; i++ {
+		k := []byte(fmt.Sprintf("k%02d", i))
+		got, err := db.Get(k)
+		if err != nil {
+			t.Fatalf("get %s: %v", k, err)
+		}
+		if string(got) != fmt.Sprintf("v%d", i) {
+			t.Fatalf("get %s: got %q", k, got)
+		}
+	}
+	_ = db.Close()
+}
+
+// TestCompactionDropsOlderVersion: two writes of the same key separated
+// by a flush, then a compaction merges them and the older value is gone.
+func TestCompactionDropsOlderVersion(t *testing.T) {
+	dir := t.TempDir()
+	opts := &kdb.Options{MemtableSizeBytes: 1, CompactionTrigger: 2}
+
+	db, _ := kdb.Open(dir, opts)
+	_ = db.Put([]byte("k"), []byte("v1"))
+	_ = db.Put([]byte("k"), []byte("v2"))
+	// CompactionTrigger=2 means the second flush triggers compaction.
+	s := db.Stats()
+	if len(s.SSTables) != 1 {
+		t.Fatalf("expected exactly 1 sstable after compaction, got %d (%+v)", len(s.SSTables), s.SSTables)
+	}
+	if s.SSTables[0].Tier != 1 {
+		t.Fatalf("expected compacted file at tier 1, got tier %d", s.SSTables[0].Tier)
+	}
+	got, err := db.Get([]byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("v2")) {
+		t.Fatalf("got %q, want v2", got)
+	}
+	_ = db.Close()
+}
+
+// TestCompactionPropagatesTombstone: a tombstone written after a value
+// must continue to shadow that value after the two SSTables are merged.
+func TestCompactionPropagatesTombstone(t *testing.T) {
+	dir := t.TempDir()
+	opts := &kdb.Options{MemtableSizeBytes: 1, CompactionTrigger: 2}
+
+	db, _ := kdb.Open(dir, opts)
+	_ = db.Put([]byte("k"), []byte("v"))
+	_ = db.Delete([]byte("k"))
+	if _, err := db.Get([]byte("k")); !errors.Is(err, kdb.ErrNotFound) {
+		t.Fatalf("post-delete: got %v, want ErrNotFound", err)
+	}
+	_ = db.Close()
+
+	db2, _ := kdb.Open(dir, opts)
+	defer db2.Close()
+	if _, err := db2.Get([]byte("k")); !errors.Is(err, kdb.ErrNotFound) {
+		t.Fatalf("after reopen: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestCompactionCascades: with trigger=2 and a memtable that flushes on
+// each write, by the time the 4th flush has been performed there should
+// be a single tier-2 file (4 flushes → 2 tier-1 → 1 tier-2).
+func TestCompactionCascades(t *testing.T) {
+	dir := t.TempDir()
+	opts := &kdb.Options{MemtableSizeBytes: 1, CompactionTrigger: 2}
+
+	db, _ := kdb.Open(dir, opts)
+	for i := 0; i < 4; i++ {
+		k := []byte(fmt.Sprintf("k%d", i))
+		_ = db.Put(k, []byte(fmt.Sprintf("v%d", i)))
+	}
+	s := db.Stats()
+	if len(s.SSTables) != 1 {
+		t.Fatalf("expected 1 sstable after cascade, got %d (%+v)", len(s.SSTables), s.SSTables)
+	}
+	if s.SSTables[0].Tier != 2 {
+		t.Fatalf("expected tier 2 after cascade, got tier %d", s.SSTables[0].Tier)
+	}
+	for i := 0; i < 4; i++ {
+		got, err := db.Get([]byte(fmt.Sprintf("k%d", i)))
+		if err != nil {
+			t.Fatalf("get k%d: %v", i, err)
+		}
+		if string(got) != fmt.Sprintf("v%d", i) {
+			t.Fatalf("get k%d: got %q", i, got)
+		}
+	}
+	_ = db.Close()
+}
+
+// TestOpenRemovesOrphanSSTable: a .sst file on disk but not in the manifest
+// is treated as an orphan from an interrupted compaction and is deleted.
+func TestOpenRemovesOrphanSSTable(t *testing.T) {
+	dir := t.TempDir()
+	opts := &kdb.Options{MemtableSizeBytes: 1}
+
+	db, _ := kdb.Open(dir, opts)
+	_ = db.Put([]byte("k"), []byte("v"))
+	_ = db.Close()
+
+	orphan := filepath.Join(dir, "000099.sst")
+	if err := os.WriteFile(orphan, []byte("junk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := kdb.Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan should have been removed, got err=%v", err)
+	}
+}
+
+// TestOpenMigratesPhase3Directory: a directory containing SSTables but no
+// MANIFEST (the Phase-3 layout) should be migrated transparently on open.
+func TestOpenMigratesPhase3Directory(t *testing.T) {
+	dir := t.TempDir()
+	opts := &kdb.Options{MemtableSizeBytes: 1}
+
+	db, _ := kdb.Open(dir, opts)
+	_ = db.Put([]byte("a"), []byte("1"))
+	_ = db.Put([]byte("b"), []byte("2"))
+	_ = db.Close()
+
+	if err := os.Remove(filepath.Join(dir, "MANIFEST")); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := kdb.Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	if _, err := os.Stat(filepath.Join(dir, "MANIFEST")); err != nil {
+		t.Fatalf("MANIFEST should have been re-created, got %v", err)
+	}
+	for k, want := range map[string]string{"a": "1", "b": "2"} {
+		got, err := db2.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("get %s: %v", k, err)
+		}
+		if string(got) != want {
+			t.Fatalf("get %s: got %q, want %q", k, got, want)
+		}
 	}
 }

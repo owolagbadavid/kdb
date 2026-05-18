@@ -5,6 +5,11 @@
 // frozen and synchronously flushed to a sorted on-disk SSTable; the WAL
 // is then rotated. Reads consult the active memtable, then the immutable
 // memtable (if a flush is in flight), then SSTables newest-first.
+//
+// Size-tiered compaction runs synchronously after each flush: when a
+// tier accumulates Options.CompactionTrigger SSTables, they merge into a
+// single SSTable in the next tier. The manifest file is the on-disk
+// source of truth for which SSTables are live.
 package kdb
 
 import (
@@ -19,7 +24,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/owolagbadavid/kdb/internal/compaction"
 	"github.com/owolagbadavid/kdb/internal/kv"
+	"github.com/owolagbadavid/kdb/internal/manifest"
 	"github.com/owolagbadavid/kdb/internal/memtable"
 	"github.com/owolagbadavid/kdb/internal/sstable"
 	"github.com/owolagbadavid/kdb/internal/wal"
@@ -34,19 +41,40 @@ const (
 )
 
 type Options struct {
-	// MemtableSizeBytes is the threshold (key+value bytes in the active
-	// memtable) above which a flush is triggered after the next write.
 	MemtableSizeBytes int64
+	CompactionTrigger int
 }
 
-func defaultOptions() *Options {
-	return &Options{MemtableSizeBytes: 4 << 20}
+func (o *Options) withDefaults() *Options {
+	out := Options{MemtableSizeBytes: 4 << 20, CompactionTrigger: 4}
+	if o != nil {
+		if o.MemtableSizeBytes != 0 {
+			out.MemtableSizeBytes = o.MemtableSizeBytes
+		}
+		if o.CompactionTrigger != 0 {
+			out.CompactionTrigger = o.CompactionTrigger
+		}
+	}
+	return &out
+}
+
+type SSTableInfo struct {
+	FileNum uint64
+	Tier    int
 }
 
 type Stats struct {
 	MemtableCount     int
 	MemtableSizeBytes int64
-	SSTables          []string // filenames, newest first
+	SSTables          []SSTableInfo // newest first
+}
+
+type sstableEntry struct {
+	reader   *sstable.Reader
+	fileNum  uint64
+	tier     int
+	smallest []byte
+	largest  []byte
 }
 
 type DB struct {
@@ -55,9 +83,9 @@ type DB struct {
 
 	mu          sync.RWMutex
 	mt          *memtable.Memtable
-	immutable   *memtable.Memtable // non-nil only during a flush
+	immutable   *memtable.Memtable
 	wal         *wal.Writer
-	sstables    []*sstable.Reader // newest first
+	sstables    []*sstableEntry // sorted by fileNum descending
 	nextFileNum uint64
 	seqno       uint64
 	closed      bool
@@ -66,34 +94,32 @@ type DB struct {
 var sstNameRe = regexp.MustCompile(`^(\d{6})\.sst$`)
 
 func Open(dir string, opts *Options) (*DB, error) {
-	if opts == nil {
-		opts = defaultOptions()
-	}
+	opts = opts.withDefaults()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-
 	db := &DB{
 		dir:  dir,
 		opts: opts,
 		mt:   memtable.New(),
 	}
 
-	entries, err := os.ReadDir(dir)
+	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
 
-	// Drop any leftover .tmp files from an interrupted flush.
-	for _, ent := range entries {
-		if strings.HasSuffix(ent.Name(), sstSuffix+tmpSuffix) {
-			_ = os.Remove(filepath.Join(dir, ent.Name()))
+	// 1. Remove leftover .tmp files from interrupted writes.
+	for _, ent := range dirEntries {
+		name := ent.Name()
+		if strings.HasSuffix(name, sstSuffix+tmpSuffix) || name == "MANIFEST.tmp" {
+			_ = os.Remove(filepath.Join(dir, name))
 		}
 	}
 
-	var sstNames []string
-	var maxNum uint64
-	for _, ent := range entries {
+	// 2. Index all .sst files present on disk by file number.
+	onDisk := map[uint64]string{}
+	for _, ent := range dirEntries {
 		m := sstNameRe.FindStringSubmatch(ent.Name())
 		if m == nil {
 			continue
@@ -102,30 +128,75 @@ func Open(dir string, opts *Options) (*DB, error) {
 		if err != nil {
 			continue
 		}
-		sstNames = append(sstNames, ent.Name())
-		if n > maxNum {
-			maxNum = n
-		}
+		onDisk[n] = ent.Name()
 	}
-	sort.Strings(sstNames) // ascending by name == by file number
-	var readers []*sstable.Reader
-	for _, name := range sstNames {
-		r, err := sstable.Open(filepath.Join(dir, name))
-		if err != nil {
-			for _, rr := range readers {
-				_ = rr.Close()
+
+	manifestEntries, err := manifest.Load(dir)
+	if err != nil {
+		return nil, fmt.Errorf("load manifest: %w", err)
+	}
+	if manifestEntries == nil && len(onDisk) > 0 {
+		nums := make([]uint64, 0, len(onDisk))
+		for n := range onDisk {
+			nums = append(nums, n)
+		}
+		sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
+		for _, n := range nums {
+			r, err := sstable.Open(filepath.Join(dir, onDisk[n]))
+			if err != nil {
+				return nil, fmt.Errorf("migrate: open sstable %s: %w", onDisk[n], err)
 			}
-			return nil, fmt.Errorf("open sstable %s: %w", name, err)
+			manifestEntries = append(manifestEntries, manifest.Entry{
+				FileNum: n, Tier: 0,
+				Smallest: append([]byte(nil), r.SmallestKey()...),
+				Largest:  append([]byte(nil), r.LargestKey()...),
+			})
+			_ = r.Close()
 		}
-		readers = append(readers, r)
+		if err := manifest.Save(dir, manifestEntries); err != nil {
+			return nil, fmt.Errorf("migrate manifest: %w", err)
+		}
 	}
-	// Reverse so the newest SSTable is at index 0.
-	for i, j := 0, len(readers)-1; i < j; i, j = i+1, j-1 {
-		readers[i], readers[j] = readers[j], readers[i]
+
+	// 4. Delete orphan SSTable files (present but not in manifest).
+	inManifest := map[uint64]bool{}
+	for _, me := range manifestEntries {
+		inManifest[me.FileNum] = true
 	}
-	db.sstables = readers
+	for n, name := range onDisk {
+		if !inManifest[n] {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
+	}
+
+	// 5. Open Reader per manifest entry.
+	var maxNum uint64
+	for _, me := range manifestEntries {
+		path := filepath.Join(dir, fmt.Sprintf("%06d.sst", me.FileNum))
+		r, err := sstable.Open(path)
+		if err != nil {
+			for _, s := range db.sstables {
+				_ = s.reader.Close()
+			}
+			return nil, fmt.Errorf("open sstable %d: %w", me.FileNum, err)
+		}
+		db.sstables = append(db.sstables, &sstableEntry{
+			reader:   r,
+			fileNum:  me.FileNum,
+			tier:     me.Tier,
+			smallest: me.Smallest,
+			largest:  me.Largest,
+		})
+		if me.FileNum > maxNum {
+			maxNum = me.FileNum
+		}
+	}
+	sort.Slice(db.sstables, func(i, j int) bool {
+		return db.sstables[i].fileNum > db.sstables[j].fileNum
+	})
 	db.nextFileNum = maxNum + 1
 
+	// 6. Replay WAL.
 	walPath := filepath.Join(dir, walFilename)
 	if err := wal.Replay(walPath, func(e kv.Entry) error {
 		switch e.Kind {
@@ -141,16 +212,17 @@ func Open(dir string, opts *Options) (*DB, error) {
 		}
 		return nil
 	}); err != nil {
-		for _, r := range db.sstables {
-			_ = r.Close()
+		for _, s := range db.sstables {
+			_ = s.reader.Close()
 		}
 		return nil, fmt.Errorf("wal replay: %w", err)
 	}
 
+	// 7. Fresh WAL writer.
 	w, err := wal.Create(walPath)
 	if err != nil {
-		for _, r := range db.sstables {
-			_ = r.Close()
+		for _, s := range db.sstables {
+			_ = s.reader.Close()
 		}
 		return nil, err
 	}
@@ -190,9 +262,6 @@ func (db *DB) write(key, value []byte, kind kv.Kind) error {
 	return nil
 }
 
-// flushLocked freezes the active memtable, writes a new SSTable, rotates
-// the WAL, and discards the immutable memtable. Must be called with
-// db.mu held for writing.
 func (db *DB) flushLocked() error {
 	db.immutable = db.mt
 	db.mt = memtable.New()
@@ -208,14 +277,9 @@ func (db *DB) flushLocked() error {
 	}
 	it := db.immutable.NewIterator()
 	for ; it.Valid(); it.Next() {
-		add := kv.Entry{
-			Key:   it.Key(),
-			Value: it.Value(),
-			Seqno: it.Seqno(),
-			Kind:  it.Kind(),
-		}
+		add := kv.Entry{Key: it.Key(), Value: it.Value(), Seqno: it.Seqno(), Kind: it.Kind()}
 		if err := w.Add(add); err != nil {
-			it.Close()
+			_ = it.Close()
 			w.Abort()
 			return err
 		}
@@ -233,8 +297,18 @@ func (db *DB) flushLocked() error {
 	if err != nil {
 		return err
 	}
-	db.sstables = append([]*sstable.Reader{r}, db.sstables...)
+	entry := &sstableEntry{
+		reader: r, fileNum: fileNum, tier: 0,
+		smallest: r.SmallestKey(), largest: r.LargestKey(),
+	}
+	db.sstables = append([]*sstableEntry{entry}, db.sstables...)
 
+	if err := db.saveManifestLocked(); err != nil {
+		return err
+	}
+
+	// Rotate WAL only after the new SSTable is durable AND referenced
+	// in the manifest — otherwise a crash here could lose the writes.
 	walPath := filepath.Join(db.dir, walFilename)
 	if err := db.wal.Close(); err != nil {
 		return err
@@ -248,6 +322,81 @@ func (db *DB) flushLocked() error {
 	}
 	db.wal = newWAL
 	db.immutable = nil
+
+	return db.maybeCompactLocked()
+}
+
+func (db *DB) saveManifestLocked() error {
+	entries := make([]manifest.Entry, 0, len(db.sstables))
+	for _, s := range db.sstables {
+		entries = append(entries, manifest.Entry{
+			FileNum: s.fileNum, Tier: s.tier,
+			Smallest: s.smallest, Largest: s.largest,
+		})
+	}
+	return manifest.Save(db.dir, entries)
+}
+
+// maybeCompactLocked runs compactions in a loop until no tier exceeds
+// the trigger. Cascading is desirable: compacting tier 0 may push tier 1
+// over the trigger, and so on.
+func (db *DB) maybeCompactLocked() error {
+	for {
+		inputs := make([]compaction.Input, 0, len(db.sstables))
+		for _, s := range db.sstables {
+			inputs = append(inputs, compaction.Input{
+				Reader: s.reader, FileNum: s.fileNum, Tier: s.tier,
+			})
+		}
+		plan := compaction.Pick(inputs, db.opts.CompactionTrigger)
+		if plan == nil {
+			return nil
+		}
+		if err := db.runCompactionLocked(plan); err != nil {
+			return err
+		}
+	}
+}
+
+func (db *DB) runCompactionLocked(plan *compaction.Plan) error {
+	newNum := db.nextFileNum
+	db.nextFileNum++
+
+	out, err := compaction.Run(plan, db.dir, newNum)
+	if err != nil {
+		return err
+	}
+	if err := syncDir(db.dir); err != nil {
+		return err
+	}
+
+	inputSet := map[uint64]bool{}
+	for _, in := range plan.Inputs {
+		inputSet[in.FileNum] = true
+	}
+	keep := db.sstables[:0:0]
+	for _, s := range db.sstables {
+		if !inputSet[s.fileNum] {
+			keep = append(keep, s)
+		}
+	}
+	keep = append(keep, &sstableEntry{
+		reader: out.Reader, fileNum: out.FileNum, tier: out.Tier,
+		smallest: out.Smallest, largest: out.Largest,
+	})
+	sort.Slice(keep, func(i, j int) bool { return keep[i].fileNum > keep[j].fileNum })
+	db.sstables = keep
+
+	if err := db.saveManifestLocked(); err != nil {
+		return err
+	}
+
+	// Manifest committed — inputs are now orphans. Safe to dispose.
+	for _, in := range plan.Inputs {
+		_ = in.Reader.Close()
+		_ = os.Remove(filepath.Join(db.dir, fmt.Sprintf("%06d.sst", in.FileNum)))
+	}
+	_ = syncDir(db.dir)
 	return nil
 }
 
@@ -266,8 +415,8 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 			return resolve(e)
 		}
 	}
-	for _, r := range db.sstables {
-		e, ok, err := r.Get(key)
+	for _, s := range db.sstables {
+		e, ok, err := s.reader.Get(key)
 		if err != nil {
 			return nil, err
 		}
@@ -288,14 +437,14 @@ func resolve(e kv.Entry) ([]byte, error) {
 func (db *DB) Stats() Stats {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	var names []string
-	for _, r := range db.sstables {
-		names = append(names, filepath.Base(r.Path()))
+	infos := make([]SSTableInfo, 0, len(db.sstables))
+	for _, s := range db.sstables {
+		infos = append(infos, SSTableInfo{FileNum: s.fileNum, Tier: s.tier})
 	}
 	return Stats{
 		MemtableCount:     db.mt.Count(),
 		MemtableSizeBytes: db.mt.SizeBytes(),
-		SSTables:          names,
+		SSTables:          infos,
 	}
 }
 
@@ -313,8 +462,8 @@ func (db *DB) Close() error {
 			firstErr = err
 		}
 	}
-	for _, r := range db.sstables {
-		if err := r.Close(); err != nil && firstErr == nil {
+	for _, s := range db.sstables {
+		if err := s.reader.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
