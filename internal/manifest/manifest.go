@@ -1,18 +1,16 @@
-// Package manifest persists the list of live SSTables and their tier as
-// an atomically-rewritten on-disk snapshot.
+// Package manifest persists the list of live SSTables, the minimum live
+// WAL log number, and their tier, as an atomically-rewritten on-disk
+// snapshot.
 //
 // File format (single MANIFEST file, rewritten in full on every change):
 //
 //	[uint32 crc][uint32 payloadLen][payload]
 //
-// where payload is:
+// payload: [uint8 version=1][varint MinLogNum][varint numEntries][entry 0]...[entry N-1]
+// Entry:   [varint fileNum][varint tier][varint smallestLen][smallest][varint largestLen][largest]
 //
-//	[uint8 version][varint numEntries][entry 0]...[entry N-1]
-//
-// Entry: [varint fileNum][varint tier][varint smallestLen][smallest][varint largestLen][largest]
-//
-// CRC32 (IEEE) is computed over the payload bytes. Save writes
-// MANIFEST.tmp, fsyncs it, renames to MANIFEST, then fsyncs the directory.
+// CRC32 (IEEE) is over the payload bytes. Save writes MANIFEST.tmp,
+// fsyncs it, renames to MANIFEST, then fsyncs the directory.
 package manifest
 
 import (
@@ -41,75 +39,86 @@ type Entry struct {
 	Largest  []byte
 }
 
-// Load reads the manifest. Returns (nil, nil) when the file does not
-// exist — that case is "no live SSTables yet" and the caller treats it
-// as an empty list.
-func Load(dir string) ([]Entry, error) {
+// Snapshot is the full state persisted in the manifest.
+type Snapshot struct {
+	MinLogNum uint64
+	Entries   []Entry
+}
+
+// Load reads the manifest. Returns a zero-value Snapshot and nil error
+// when the file does not exist — that case is "fresh dir, no SSTables".
+func Load(dir string) (Snapshot, error) {
+	var s Snapshot
 	data, err := os.ReadFile(filepath.Join(dir, filename))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return s, nil
 		}
-		return nil, err
+		return s, err
 	}
 	if len(data) < 8 {
-		return nil, fmt.Errorf("manifest: too short (%d bytes)", len(data))
+		return s, fmt.Errorf("manifest: too short (%d bytes)", len(data))
 	}
 	wantCRC := binary.LittleEndian.Uint32(data[0:4])
 	payloadLen := binary.LittleEndian.Uint32(data[4:8])
 	if int(payloadLen)+8 != len(data) {
-		return nil, fmt.Errorf("manifest: length mismatch (header=%d, file=%d)", payloadLen, len(data)-8)
+		return s, fmt.Errorf("manifest: length mismatch (header=%d, file=%d)", payloadLen, len(data)-8)
 	}
 	payload := data[8:]
 	if crc32.Checksum(payload, crcTable) != wantCRC {
-		return nil, fmt.Errorf("manifest: crc mismatch")
+		return s, fmt.Errorf("manifest: crc mismatch")
 	}
 
 	r := bytes.NewReader(payload)
 	ver, err := r.ReadByte()
 	if err != nil {
-		return nil, err
+		return s, err
 	}
 	if ver != version {
-		return nil, fmt.Errorf("manifest: unsupported version %d", ver)
+		return s, fmt.Errorf("manifest: unsupported version %d", ver)
+	}
+	s.MinLogNum, err = binary.ReadUvarint(r)
+	if err != nil {
+		return s, err
 	}
 	numEntries, err := binary.ReadUvarint(r)
 	if err != nil {
-		return nil, err
+		return s, err
 	}
-	entries := make([]Entry, 0, numEntries)
+	s.Entries = make([]Entry, 0, numEntries)
 	for i := uint64(0); i < numEntries; i++ {
 		var e Entry
 		fn, err := binary.ReadUvarint(r)
 		if err != nil {
-			return nil, err
+			return s, err
 		}
 		e.FileNum = fn
 		tier, err := binary.ReadUvarint(r)
 		if err != nil {
-			return nil, err
+			return s, err
 		}
 		e.Tier = int(tier)
 		if e.Smallest, err = readLPBytes(r); err != nil {
-			return nil, err
+			return s, err
 		}
 		if e.Largest, err = readLPBytes(r); err != nil {
-			return nil, err
+			return s, err
 		}
-		entries = append(entries, e)
+		s.Entries = append(s.Entries, e)
 	}
-	return entries, nil
+	return s, nil
 }
 
-// Save writes entries to dir atomically. A zero-length entries slice
-// produces a valid manifest representing "no live SSTables".
-func Save(dir string, entries []Entry) error {
+// Save writes the snapshot to dir atomically.
+func Save(dir string, snap Snapshot) error {
 	var payload bytes.Buffer
 	payload.WriteByte(version)
 	var u [binary.MaxVarintLen64]byte
-	nn := binary.PutUvarint(u[:], uint64(len(entries)))
+	nn := binary.PutUvarint(u[:], snap.MinLogNum)
 	payload.Write(u[:nn])
-	for _, e := range entries {
+	nn = binary.PutUvarint(u[:], uint64(len(snap.Entries)))
+	payload.Write(u[:nn])
+	for _, e := range snap.Entries {
 		nn = binary.PutUvarint(u[:], e.FileNum)
 		payload.Write(u[:nn])
 		nn = binary.PutUvarint(u[:], uint64(e.Tier))
