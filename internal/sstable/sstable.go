@@ -25,12 +25,16 @@ import (
 	"os"
 	"sort"
 
+	"github.com/owolagbadavid/kdb/internal/bloom"
 	"github.com/owolagbadavid/kdb/internal/kv"
 )
 
 const (
-	indexInterval = 16
-	footerSize    = 16
+	indexInterval    = 16
+	footerSize       = 40
+	magic            = 0xB10F11A5_5570DEAD
+	filterVersion1   = 1
+	filterV1HeaderSz = 13
 )
 
 type indexEntry struct {
@@ -48,6 +52,7 @@ type Writer struct {
 	offset  uint64
 	count   int
 	index   []indexEntry
+	hashes  []uint64
 	lastKey []byte
 }
 
@@ -70,6 +75,7 @@ func (w *Writer) Add(e kv.Entry) error {
 			offset: w.offset,
 		})
 	}
+	w.hashes = append(w.hashes, bloom.Hash(e.Key))
 	n, err := encodeRecord(w.bw, e)
 	if err != nil {
 		return err
@@ -90,10 +96,34 @@ func (w *Writer) Finish() error {
 		w.offset += uint64(n)
 	}
 	indexLen := w.offset - indexOffset
+	filterOffset := w.offset
+
+	var filterBytes []byte
+	if len(w.hashes) > 0 {
+		f := bloom.New(uint64(len(w.hashes)), 0.01)
+		for _, h := range w.hashes {
+			f.AddHash(h)
+		}
+		filterBytes = encodeFilter(f)
+	}
+	w.hashes = nil
+
+	if len(filterBytes) > 0 {
+		nn, err := w.bw.Write(filterBytes)
+		if err != nil {
+			return err
+		}
+		w.offset += uint64(nn)
+	}
+	filterLen := uint64(len(filterBytes))
 
 	var footer [footerSize]byte
 	binary.LittleEndian.PutUint64(footer[0:8], indexOffset)
 	binary.LittleEndian.PutUint64(footer[8:16], indexLen)
+	binary.LittleEndian.PutUint64(footer[16:24], filterOffset)
+	binary.LittleEndian.PutUint64(footer[24:32], filterLen)
+	binary.LittleEndian.PutUint64(footer[32:], magic)
+
 	if _, err := w.bw.Write(footer[:]); err != nil {
 		return err
 	}
@@ -178,6 +208,7 @@ type Reader struct {
 	dataLen  uint64
 	smallest []byte
 	largest  []byte
+	filter   *bloom.Filter
 }
 
 func Open(path string) (*Reader, error) {
@@ -199,8 +230,21 @@ func Open(path string) (*Reader, error) {
 		f.Close()
 		return nil, err
 	}
+
+	if binary.LittleEndian.Uint64(footer[32:40]) != magic {
+		return nil, errors.New("errCorruptFooter")
+	}
+
 	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
 	indexLen := binary.LittleEndian.Uint64(footer[8:16])
+	filterOffset := binary.LittleEndian.Uint64(footer[16:24])
+	filterLen := binary.LittleEndian.Uint64(footer[24:32])
+
+	if filterOffset != indexOffset+indexLen {
+		return nil, fmt.Errorf("sstable: %s gap/overlap: filterOff=%d want %d",
+			path, filterOffset, indexOffset+indexLen)
+	}
+
 	if indexOffset+indexLen+footerSize != uint64(stat.Size()) {
 		f.Close()
 		return nil, fmt.Errorf("sstable: %s corrupt footer (indexOff=%d indexLen=%d size=%d)",
@@ -221,7 +265,7 @@ func Open(path string) (*Reader, error) {
 			return nil, fmt.Errorf("sstable: bad index keylen")
 		}
 		p = p[n:]
-		if uint64(len(p)) < klen+8 {
+		if klen > uint64(len(p)) || uint64(len(p))-klen < 8 {
 			f.Close()
 			return nil, fmt.Errorf("sstable: truncated index entry")
 		}
@@ -231,7 +275,20 @@ func Open(path string) (*Reader, error) {
 		p = p[8:]
 		index = append(index, indexEntry{key: key, offset: off})
 	}
-	r := &Reader{f: f, path: path, index: index, dataLen: indexOffset}
+
+	filterBuf := make([]byte, filterLen)
+	if _, err := f.ReadAt(filterBuf, int64(filterOffset)); err != nil {
+		f.Close()
+		return nil, err
+	}
+
+	filter, err := parseFilter(filterBuf)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+
+	r := &Reader{f: f, path: path, index: index, dataLen: indexOffset, filter: filter}
 	if len(index) > 0 {
 		r.smallest = index[0].key
 		last, err := r.findLargestKey()
@@ -276,6 +333,11 @@ func (r *Reader) findLargestKey() ([]byte, error) {
 func (r *Reader) Get(key []byte) (kv.Entry, bool, error) {
 	if len(r.index) == 0 {
 		return kv.Entry{}, false, nil
+	}
+	if r.filter != nil {
+		if !r.filter.Contains(key) {
+			return kv.Entry{}, false, nil
+		}
 	}
 	i := sort.Search(len(r.index), func(i int) bool {
 		return bytes.Compare(r.index[i].key, key) > 0
@@ -399,4 +461,43 @@ func (it *sstIterator) advance() {
 	}
 	it.cur = e
 	it.valid = true
+}
+
+func parseFilter(buf []byte) (*bloom.Filter, error) {
+	if len(buf) == 0 {
+		return nil, nil
+	}
+	switch v := buf[0]; v { // byte 0 is the only field with a fixed position
+	case filterVersion1:
+		return parseFilterV1(buf)
+	default:
+		return nil, fmt.Errorf("sstable: unknown filter version %d", v)
+	}
+}
+
+func parseFilterV1(buf []byte) (*bloom.Filter, error) {
+	if len(buf) < filterV1HeaderSz {
+		return nil, fmt.Errorf("sstable: filter v1 too small: %d bytes", len(buf))
+	}
+	m := binary.LittleEndian.Uint64(buf[1:9])
+	k := uint64(binary.LittleEndian.Uint32(buf[9:13]))
+	bits := buf[filterV1HeaderSz:]
+
+	if m == 0 || k == 0 {
+		return nil, fmt.Errorf("sstable: invalid filter params m=%d k=%d", m, k)
+	}
+	if want := (m + 7) / 8; uint64(len(bits)) != want {
+		return nil, fmt.Errorf("sstable: filter length mismatch: have %d want %d (m=%d)",
+			len(bits), want, m)
+	}
+	return &bloom.Filter{Version: filterVersion1, Bits: bits, M: m, K: k}, nil
+}
+
+func encodeFilter(f *bloom.Filter) []byte {
+	buf := make([]byte, filterV1HeaderSz+len(f.Bits))
+	buf[0] = filterVersion1
+	binary.LittleEndian.PutUint64(buf[1:9], f.M)
+	binary.LittleEndian.PutUint32(buf[9:13], uint32(f.K))
+	copy(buf[filterV1HeaderSz:], f.Bits)
+	return buf
 }
