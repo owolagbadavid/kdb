@@ -2,7 +2,9 @@ package sstable
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -181,5 +183,154 @@ func TestAddRejectsNonAscending(t *testing.T) {
 	_ = w.Add(kv.Entry{Key: []byte("b"), Value: []byte("1"), Seqno: 1, Kind: kv.KindPut})
 	if err := w.Add(kv.Entry{Key: []byte("a"), Value: []byte("2"), Seqno: 2, Kind: kv.KindPut}); err == nil {
 		t.Fatal("expected ascending-key error")
+	}
+}
+
+func TestFilterBuiltAndSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "001.sst")
+	w, _ := NewWriter(path)
+	for i := 0; i < 200; i++ {
+		_ = w.Add(kv.Entry{
+			Key:   []byte(fmt.Sprintf("key-%04d", i)),
+			Value: []byte("v"),
+			Seqno: uint64(i + 1),
+			Kind:  kv.KindPut,
+		})
+	}
+	if err := w.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if r.filter == nil {
+		t.Fatal("expected filter to be present after Open")
+	}
+	if r.filter.M == 0 || r.filter.K == 0 {
+		t.Fatalf("filter params invalid: m=%d k=%d", r.filter.M, r.filter.K)
+	}
+}
+
+func TestFilterAcceptsAllPresentKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "001.sst")
+	w, _ := NewWriter(path)
+	const n = 500
+	for i := 0; i < n; i++ {
+		_ = w.Add(kv.Entry{
+			Key:   []byte(fmt.Sprintf("key-%05d", i)),
+			Value: []byte("v"),
+			Seqno: uint64(i + 1),
+			Kind:  kv.KindPut,
+		})
+	}
+	_ = w.Finish()
+
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	for i := 0; i < n; i++ {
+		k := []byte(fmt.Sprintf("key-%05d", i))
+		if !r.filter.Contains(k) {
+			t.Fatalf("filter rejected present key %q", k)
+		}
+	}
+}
+
+func TestFilterRejectsMostAbsentKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "001.sst")
+	w, _ := NewWriter(path)
+	const n = 2000
+	for i := 0; i < n; i++ {
+		_ = w.Add(kv.Entry{
+			Key:   []byte(fmt.Sprintf("present-%06d", i)),
+			Value: []byte("v"),
+			Seqno: uint64(i + 1),
+			Kind:  kv.KindPut,
+		})
+	}
+	_ = w.Finish()
+
+	r, _ := Open(path)
+	defer r.Close()
+
+	const trials = 5000
+	hits := 0
+	for i := 0; i < trials; i++ {
+		k := []byte(fmt.Sprintf("absent-%06d", i))
+		if r.filter.Contains(k) {
+			hits++
+		}
+	}
+	rate := float64(hits) / trials
+	if rate > 0.05 {
+		t.Errorf("filter false-positive rate %.4f (%d/%d), expected <0.05", rate, hits, trials)
+	}
+}
+
+func TestEmptySSTableHasNoFilter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "001.sst")
+	w, _ := NewWriter(path)
+	if err := w.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if r.filter != nil {
+		t.Fatalf("empty SSTable should not carry a filter, got %+v", r.filter)
+	}
+	// Get on any key should miss without touching the (absent) index.
+	if _, ok, err := r.Get([]byte("anything")); err != nil || ok {
+		t.Fatalf("Get on empty SSTable: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestCorruptMagicRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "001.sst")
+	w, _ := NewWriter(path)
+	_ = w.Add(kv.Entry{Key: []byte("k"), Value: []byte("v"), Seqno: 1, Kind: kv.KindPut})
+	_ = w.Finish()
+
+	// Overwrite the 8 magic bytes at the very end of the file.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, _ := f.Stat()
+	if _, err := f.WriteAt([]byte{0, 0, 0, 0, 0, 0, 0, 0}, stat.Size()-8); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	if _, err := Open(path); err == nil {
+		t.Fatal("expected Open to reject SSTable with corrupt magic")
+	}
+}
+
+func TestUnknownFilterVersionRejected(t *testing.T) {
+	buf := []byte{0xff, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0}
+	if _, err := parseFilter(buf); err == nil {
+		t.Fatal("expected error for unknown filter version")
+	}
+}
+
+func TestTruncatedFilterRejected(t *testing.T) {
+	// version=1, m=64 (so 8 bytes of bits expected), k=3, but provide 0 bits.
+	buf := make([]byte, filterV1HeaderSz)
+	buf[0] = filterVersion1
+	binary.LittleEndian.PutUint64(buf[1:9], 64)
+	binary.LittleEndian.PutUint32(buf[9:13], 3)
+	if _, err := parseFilter(buf); err == nil {
+		t.Fatal("expected length-mismatch error")
 	}
 }

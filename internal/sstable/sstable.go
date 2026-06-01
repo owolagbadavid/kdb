@@ -8,11 +8,13 @@
 //	[index entry 0]      -- one per every indexInterval records
 //	[index entry 1]
 //	...
-//	[footer]             -- fixed 16 bytes at end of file
+//	[filter block]       -- bloom filter over every key (omitted if no records)
+//	[footer]             -- fixed 40 bytes at end of file
 //
-// Record: [varint keylen][key][varint vallen][value][uint8 kind][uint64 seqno]
-// Index entry: [varint keylen][key][uint64 offset]
-// Footer: [uint64 indexOffset][uint64 indexLen]
+// Record:       [varint keylen][key][varint vallen][value][uint8 kind][uint64 seqno]
+// Index entry:  [varint keylen][key][uint64 offset]
+// Filter block: [uint8 version][uint64 m][uint32 k][bits]
+// Footer:       [uint64 indexOffset][uint64 indexLen][uint64 filterOffset][uint64 filterLen][uint64 magic]
 package sstable
 
 import (
@@ -232,7 +234,8 @@ func Open(path string) (*Reader, error) {
 	}
 
 	if binary.LittleEndian.Uint64(footer[32:40]) != magic {
-		return nil, errors.New("errCorruptFooter")
+		f.Close()
+		return nil, fmt.Errorf("sstable: %s corrupt footer (bad magic)", path)
 	}
 
 	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
@@ -241,14 +244,15 @@ func Open(path string) (*Reader, error) {
 	filterLen := binary.LittleEndian.Uint64(footer[24:32])
 
 	if filterOffset != indexOffset+indexLen {
+		f.Close()
 		return nil, fmt.Errorf("sstable: %s gap/overlap: filterOff=%d want %d",
 			path, filterOffset, indexOffset+indexLen)
 	}
 
-	if indexOffset+indexLen+footerSize != uint64(stat.Size()) {
+	if filterOffset+filterLen+footerSize != uint64(stat.Size()) {
 		f.Close()
-		return nil, fmt.Errorf("sstable: %s corrupt footer (indexOff=%d indexLen=%d size=%d)",
-			path, indexOffset, indexLen, stat.Size())
+		return nil, fmt.Errorf("sstable: %s corrupt footer (indexOff=%d indexLen=%d filterLen=%d size=%d)",
+			path, indexOffset, indexLen, filterLen, stat.Size())
 	}
 
 	indexBuf := make([]byte, indexLen)
