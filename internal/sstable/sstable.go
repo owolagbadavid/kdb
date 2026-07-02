@@ -8,13 +8,17 @@
 //	[index entry 0]      -- one per every indexInterval records
 //	[index entry 1]
 //	...
-//	[filter block]       -- bloom filter over every key (omitted if no records)
+//	[filter block]       -- bloom filter over user-keys (omitted if no records)
 //	[footer]             -- fixed 40 bytes at end of file
 //
-// Record:       [varint keylen][key][varint vallen][value][uint8 kind][uint64 seqno]
-// Index entry:  [varint keylen][key][uint64 offset]
+// Record:       [varint keylen][internal key][varint vallen][value]
+// Index entry:  [varint keylen][internal key][uint64 offset]
 // Filter block: [uint8 version][uint64 m][uint32 k][bits]
 // Footer:       [uint64 indexOffset][uint64 indexLen][uint64 filterOffset][uint64 filterLen][uint64 magic]
+//
+// Records are sorted by internal key (user key ascending, then seqno
+// descending). The bloom filter is hashed over user keys (not internal
+// keys) so point lookups can short-circuit before any seqno-aware seek.
 package sstable
 
 import (
@@ -44,18 +48,19 @@ type indexEntry struct {
 	offset uint64
 }
 
-// Writer builds an SSTable. Add must be called with keys in strictly
-// ascending order; Finish atomically renames the .tmp into place.
+// Writer builds an SSTable. Add must be called with internal keys in
+// strictly ascending order (user key ascending, then seqno descending
+// for the same user key). Finish atomically renames the .tmp into place.
 type Writer struct {
-	path    string
-	tmpPath string
-	f       *os.File
-	bw      *bufio.Writer
-	offset  uint64
-	count   int
-	index   []indexEntry
-	hashes  []uint64
-	lastKey []byte
+	path            string
+	tmpPath         string
+	f               *os.File
+	bw              *bufio.Writer
+	offset          uint64
+	count           int
+	index           []indexEntry
+	hashes          []uint64
+	lastInternalKey []byte
 }
 
 func NewWriter(path string) (*Writer, error) {
@@ -68,23 +73,27 @@ func NewWriter(path string) (*Writer, error) {
 }
 
 func (w *Writer) Add(e kv.Entry) error {
-	if w.lastKey != nil && bytes.Compare(e.Key, w.lastKey) <= 0 {
-		return fmt.Errorf("sstable: keys must be strictly ascending (got %q after %q)", e.Key, w.lastKey)
+	ik := kv.MakeInternalKey(e.Key, e.Seqno, e.Kind)
+	if w.lastInternalKey != nil && kv.CompareInternal(ik, w.lastInternalKey) <= 0 {
+		return fmt.Errorf("sstable: keys must be strictly ascending (got user=%q seq=%d after %q)",
+			e.Key, e.Seqno, kv.UserKeyOf(w.lastInternalKey))
 	}
 	if w.count%indexInterval == 0 {
 		w.index = append(w.index, indexEntry{
-			key:    append([]byte(nil), e.Key...),
+			key:    append([]byte(nil), ik...),
 			offset: w.offset,
 		})
 	}
+	// Bloom is hashed over user keys so point lookups by user key can
+	// short-circuit without knowing any seqno.
 	w.hashes = append(w.hashes, bloom.Hash(e.Key))
-	n, err := encodeRecord(w.bw, e)
+	n, err := encodeRecord(w.bw, ik, e.Value)
 	if err != nil {
 		return err
 	}
 	w.offset += uint64(n)
 	w.count++
-	w.lastKey = append(w.lastKey[:0], e.Key...)
+	w.lastInternalKey = append(w.lastInternalKey[:0], ik...)
 	return nil
 }
 
@@ -146,38 +155,29 @@ func (w *Writer) Abort() {
 	_ = os.Remove(w.tmpPath)
 }
 
-func encodeRecord(w *bufio.Writer, e kv.Entry) (int, error) {
+func encodeRecord(w *bufio.Writer, internalKey, value []byte) (int, error) {
 	var u [binary.MaxVarintLen64]byte
 	n := 0
-	nn := binary.PutUvarint(u[:], uint64(len(e.Key)))
+	nn := binary.PutUvarint(u[:], uint64(len(internalKey)))
 	if _, err := w.Write(u[:nn]); err != nil {
 		return n, err
 	}
 	n += nn
-	if _, err := w.Write(e.Key); err != nil {
+	if _, err := w.Write(internalKey); err != nil {
 		return n, err
 	}
-	n += len(e.Key)
-	nn = binary.PutUvarint(u[:], uint64(len(e.Value)))
+	n += len(internalKey)
+	nn = binary.PutUvarint(u[:], uint64(len(value)))
 	if _, err := w.Write(u[:nn]); err != nil {
 		return n, err
 	}
 	n += nn
-	if len(e.Value) > 0 {
-		if _, err := w.Write(e.Value); err != nil {
+	if len(value) > 0 {
+		if _, err := w.Write(value); err != nil {
 			return n, err
 		}
-		n += len(e.Value)
+		n += len(value)
 	}
-	if err := w.WriteByte(byte(e.Kind)); err != nil {
-		return n, err
-	}
-	n++
-	binary.LittleEndian.PutUint64(u[0:8], e.Seqno)
-	if _, err := w.Write(u[0:8]); err != nil {
-		return n, err
-	}
-	n += 8
 	return n, nil
 }
 
@@ -294,7 +294,10 @@ func Open(path string) (*Reader, error) {
 
 	r := &Reader{f: f, path: path, index: index, dataLen: indexOffset, filter: filter}
 	if len(index) > 0 {
-		r.smallest = index[0].key
+		// Index entries hold internal keys; expose only the user-key
+		// portion via Smallest/Largest, which is what the manifest
+		// and range-overlap logic care about.
+		r.smallest = append([]byte(nil), kv.UserKeyOf(index[0].key)...)
 		last, err := r.findLargestKey()
 		if err != nil {
 			f.Close()
@@ -314,65 +317,88 @@ func (r *Reader) SmallestKey() []byte { return r.smallest }
 // LargestKey returns the last key in the SSTable, or nil if empty.
 func (r *Reader) LargestKey() []byte { return r.largest }
 
+// findLargestKey scans the final data block and returns the user key of
+// the last record. Used to populate the manifest's per-SSTable range.
 func (r *Reader) findLargestKey() ([]byte, error) {
 	last := r.index[len(r.index)-1]
 	sr := io.NewSectionReader(r.f, int64(last.offset), int64(r.dataLen-last.offset))
 	br := bufio.NewReader(sr)
-	var key []byte
+	var lastIK []byte
 	for {
-		e, err := decodeRecord(br)
+		ik, _, err := decodeRecord(br)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return key, nil
+				if lastIK == nil {
+					return nil, nil
+				}
+				return append([]byte(nil), kv.UserKeyOf(lastIK)...), nil
 			}
 			return nil, err
 		}
-		key = e.Key
+		lastIK = ik
 	}
 }
 
-// Get returns the entry for key. The bool reports whether key was present
-// (a tombstone hit returns true with kind == KindDelete; callers translate
-// that into "deleted").
-func (r *Reader) Get(key []byte) (kv.Entry, bool, error) {
+// Get returns the newest visible version of userKey. A tombstone hit
+// returns true with Kind == KindDelete; callers translate that into
+// "deleted." For a snapshot-aware read, use GetAt.
+func (r *Reader) Get(userKey []byte) (kv.Entry, bool, error) {
+	return r.GetAt(userKey, kv.SeqnoMax)
+}
+
+// GetAt returns the newest version of userKey with seqno <= snapSeq, or
+// (Entry{}, false, nil) if no such version is present. The bloom filter
+// short-circuits when the user key is definitely absent.
+func (r *Reader) GetAt(userKey []byte, snapSeq uint64) (kv.Entry, bool, error) {
 	if len(r.index) == 0 {
 		return kv.Entry{}, false, nil
 	}
-	if r.filter != nil {
-		if !r.filter.Contains(key) {
-			return kv.Entry{}, false, nil
-		}
-	}
-	i := sort.Search(len(r.index), func(i int) bool {
-		return bytes.Compare(r.index[i].key, key) > 0
-	})
-	if i == 0 {
-		// key sorts before the first record in this SSTable.
+	if r.filter != nil && !r.filter.Contains(userKey) {
 		return kv.Entry{}, false, nil
 	}
-	startOffset := r.index[i-1].offset
-	var endOffset uint64
-	if i < len(r.index) {
-		endOffset = r.index[i].offset
-	} else {
-		endOffset = r.dataLen
+	seek := kv.MakeInternalKey(userKey, snapSeq, kv.KindMax)
+	i := sort.Search(len(r.index), func(i int) bool {
+		return kv.CompareInternal(r.index[i].key, seek) > 0
+	})
+	// i == 0 means the seek sorts before every index entry's first
+	// record. The seek for (userKey, snapSeq, kindMax) is the smallest
+	// possible internal key for userKey, so seek < index[0] does NOT
+	// imply "userKey absent" — we still need to scan block 0 to see if
+	// it holds the user key. Read all records from startOffset to EOF
+	// (the scan terminates as soon as the user key is found or passed).
+	var startOffset uint64
+	if i > 0 {
+		startOffset = r.index[i-1].offset
 	}
-	sr := io.NewSectionReader(r.f, int64(startOffset), int64(endOffset-startOffset))
+	sr := io.NewSectionReader(r.f, int64(startOffset), int64(r.dataLen-startOffset))
 	br := bufio.NewReader(sr)
 	for {
-		e, err := decodeRecord(br)
+		ik, value, err := decodeRecord(br)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return kv.Entry{}, false, nil
 			}
 			return kv.Entry{}, false, err
 		}
-		switch bytes.Compare(e.Key, key) {
-		case 0:
-			return e, true, nil
+		uk := kv.UserKeyOf(ik)
+		switch bytes.Compare(uk, userKey) {
+		case -1:
+			continue // earlier user key, keep scanning
 		case 1:
-			return kv.Entry{}, false, nil
+			return kv.Entry{}, false, nil // passed it, no visible version
 		}
+		// uk == userKey. Records here are sorted by seqno descending,
+		// so the first one with seqno <= snapSeq is the newest visible.
+		seqno, kind := kv.DecodeTrailer(ik)
+		if seqno > snapSeq {
+			continue
+		}
+		return kv.Entry{
+			Key:   append([]byte(nil), uk...),
+			Value: value,
+			Seqno: seqno,
+			Kind:  kind,
+		}, true, nil
 	}
 }
 
@@ -383,45 +409,33 @@ func (r *Reader) NewIterator() kv.Iterator {
 	return it
 }
 
-func decodeRecord(br *bufio.Reader) (kv.Entry, error) {
-	var e kv.Entry
+// decodeRecord reads one (internalKey, value) record from br.
+func decodeRecord(br *bufio.Reader) (internalKey, value []byte, err error) {
 	klen, err := binary.ReadUvarint(br)
 	if err != nil {
-		return e, err
+		return nil, nil, err
 	}
-	key := make([]byte, klen)
-	if _, err := io.ReadFull(br, key); err != nil {
-		return e, err
+	internalKey = make([]byte, klen)
+	if _, err := io.ReadFull(br, internalKey); err != nil {
+		return nil, nil, err
 	}
 	vlen, err := binary.ReadUvarint(br)
 	if err != nil {
-		return e, err
+		return nil, nil, err
 	}
-	var val []byte
 	if vlen > 0 {
-		val = make([]byte, vlen)
-		if _, err := io.ReadFull(br, val); err != nil {
-			return e, err
+		value = make([]byte, vlen)
+		if _, err := io.ReadFull(br, value); err != nil {
+			return nil, nil, err
 		}
 	}
-	kind, err := br.ReadByte()
-	if err != nil {
-		return e, err
-	}
-	var seqBuf [8]byte
-	if _, err := io.ReadFull(br, seqBuf[:]); err != nil {
-		return e, err
-	}
-	e.Key = key
-	e.Value = val
-	e.Kind = kv.Kind(kind)
-	e.Seqno = binary.LittleEndian.Uint64(seqBuf[:])
-	return e, nil
+	return internalKey, value, nil
 }
 
 type sstIterator struct {
 	r     *Reader
 	br    *bufio.Reader
+	curIK []byte // current internal key
 	cur   kv.Entry
 	valid bool
 }
@@ -434,11 +448,15 @@ func (it *sstIterator) Kind() kv.Kind { return it.cur.Kind }
 func (it *sstIterator) Next()         { it.advance() }
 func (it *sstIterator) Close() error  { return nil }
 
-func (it *sstIterator) Seek(key []byte) {
+// Seek positions at the first version (any seqno) of the smallest user
+// key >= target. Within the same user key, iteration proceeds from
+// newest seqno to oldest before moving to the next user key.
+func (it *sstIterator) Seek(target []byte) {
+	seek := kv.MakeInternalKey(target, kv.SeqnoMax, kv.KindMax)
 	var startOffset uint64
 	if len(it.r.index) > 0 {
 		i := sort.Search(len(it.r.index), func(i int) bool {
-			return bytes.Compare(it.r.index[i].key, key) > 0
+			return kv.CompareInternal(it.r.index[i].key, seek) > 0
 		})
 		if i > 0 {
 			startOffset = it.r.index[i-1].offset
@@ -451,19 +469,26 @@ func (it *sstIterator) Seek(key []byte) {
 		if !it.valid {
 			return
 		}
-		if bytes.Compare(it.cur.Key, key) >= 0 {
+		if kv.CompareInternal(it.curIK, seek) >= 0 {
 			return
 		}
 	}
 }
 
 func (it *sstIterator) advance() {
-	e, err := decodeRecord(it.br)
+	ik, value, err := decodeRecord(it.br)
 	if err != nil {
 		it.valid = false
 		return
 	}
-	it.cur = e
+	seqno, kind := kv.DecodeTrailer(ik)
+	it.curIK = ik
+	it.cur = kv.Entry{
+		Key:   kv.UserKeyOf(ik),
+		Value: value,
+		Seqno: seqno,
+		Kind:  kind,
+	}
 	it.valid = true
 }
 

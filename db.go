@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/owolagbadavid/kdb/internal/kv"
 	"github.com/owolagbadavid/kdb/internal/manifest"
@@ -103,8 +104,11 @@ type DB struct {
 	current     *version.Version
 	nextFileNum uint64
 	minLogNum   uint64 // mirror of manifest's MinLogNum
-	seqno       uint64
-	closed      bool
+	// seqno is the monotonically increasing per-write counter. Atomic
+	// because GetSnapshot reads it without holding db.mu (snapshot
+	// acquisition must not contend with writes on the slow lock).
+	seqno  atomic.Uint64
+	closed bool
 
 	activeReaders sync.WaitGroup // in-flight Gets holding a version ref
 
@@ -118,6 +122,9 @@ type DB struct {
 	disposeDone chan struct{}
 
 	flushFault func() error // test-only; runs inside flushOne before manifest save
+
+	snapList *SnapshotList
+	snMu     sync.Mutex
 }
 
 var (
@@ -157,6 +164,7 @@ func Open(dir string, opts *Options) (*DB, error) {
 		flushDone:   make(chan struct{}),
 		disposeCh:   make(chan *version.Handle, 64),
 		disposeDone: make(chan struct{}),
+		snapList:    newSnapshotList(),
 	}
 	db.flushCond = sync.NewCond(&db.mu)
 
@@ -257,8 +265,8 @@ func Open(dir string, opts *Options) (*DB, error) {
 			default:
 				return fmt.Errorf("wal %d: unknown kind %d", n, e.Kind)
 			}
-			if e.Seqno > db.seqno {
-				db.seqno = e.Seqno
+			if e.Seqno > db.seqno.Load() {
+				db.seqno.Store(e.Seqno)
 			}
 			return nil
 		}); err != nil {
@@ -301,18 +309,38 @@ func Open(dir string, opts *Options) (*DB, error) {
 	return db, nil
 }
 
+func (db *DB) GetSnapshot() uint64 {
+	seq := db.seqno.Load()
+	db.snMu.Lock()
+	db.snapList.Insert(seq)
+	db.snMu.Unlock()
+	return seq
+}
+
+// ReleaseSnapshot is idempotent: a double-release or unknown seq is a
+// silent no-op (the bool from SnapshotList.Remove is intentionally
+// discarded so callers don't have to track release state).
+func (db *DB) ReleaseSnapshot(seq uint64) error {
+	db.snMu.Lock()
+	db.snapList.Remove(seq)
+	db.snMu.Unlock()
+	return nil
+}
+
 func (db *DB) Put(key, value []byte) error { return db.write(key, value, kv.KindPut) }
 func (db *DB) Delete(key []byte) error     { return db.write(key, nil, kv.KindDelete) }
 
 func (db *DB) write(key, value []byte, kind kv.Kind) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+
 	if db.closed {
 		return errClosed
 	}
 
-	db.seqno++
-	e := kv.Entry{Key: key, Value: value, Seqno: db.seqno, Kind: kind}
+	seq := db.seqno.Add(1)
+
+	e := kv.Entry{Key: key, Value: value, Seqno: seq, Kind: kind}
 	if err := db.wal.Append(e); err != nil {
 		return err
 	}
@@ -320,9 +348,9 @@ func (db *DB) write(key, value []byte, kind kv.Kind) error {
 		return err
 	}
 	if kind == kv.KindPut {
-		db.mt.Put(key, value, db.seqno)
+		db.mt.Put(key, value, seq)
 	} else {
-		db.mt.Delete(key, db.seqno)
+		db.mt.Delete(key, seq)
 	}
 
 	if db.mt.Count() > 0 && db.mt.SizeBytes() >= db.opts.MemtableSizeBytes {

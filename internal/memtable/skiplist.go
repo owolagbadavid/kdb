@@ -15,14 +15,17 @@ const (
 type node struct {
 	key   []byte
 	value []byte
-	seqno uint64
-	kind  kv.Kind
 	next  []*node
 }
 
-// Skiplist is a probabilistic ordered map keyed by []byte. It is not safe
-// for concurrent use; callers must serialise writes (concurrent reads
-// without writers are fine).
+// Skiplist is a probabilistic ordered map over opaque byte keys. It is
+// not safe for concurrent use; callers must serialise writes (concurrent
+// reads without writers are fine).
+//
+// In the memtable's MVCC layout the keys are internal keys (user key +
+// 8-byte trailer encoding seqno+kind). The skiplist itself does not
+// interpret keys; the memtable wrapper is responsible for building and
+// decoding internal keys.
 type Skiplist struct {
 	head      *node
 	height    int
@@ -37,13 +40,14 @@ func NewSkiplist() *Skiplist {
 	}
 }
 
-// Insert sets key to (value, seqno, kind). If key is present, the entry is
-// overwritten in place.
-func (s *Skiplist) Insert(key, value []byte, seqno uint64, kind kv.Kind) {
+// Insert sets key to value. If key already exists (exact byte match) the
+// value is updated in place; otherwise a new node is created. WAL replay
+// can re-deliver the same internal key, so overwriting is idempotent.
+func (s *Skiplist) Insert(key, value []byte) {
 	var prev [maxHeight]*node
 	x := s.head
 	for i := s.height - 1; i >= 0; i-- {
-		for x.next[i] != nil && bytes.Compare(x.next[i].key, key) < 0 {
+		for x.next[i] != nil && kv.CompareInternal(x.next[i].key, key) < 0 {
 			x = x.next[i]
 		}
 		prev[i] = x
@@ -52,8 +56,6 @@ func (s *Skiplist) Insert(key, value []byte, seqno uint64, kind kv.Kind) {
 	if n := x.next[0]; n != nil && bytes.Equal(n.key, key) {
 		s.sizeBytes += int64(len(value)) - int64(len(n.value))
 		n.value = value
-		n.seqno = seqno
-		n.kind = kind
 		return
 	}
 
@@ -68,8 +70,6 @@ func (s *Skiplist) Insert(key, value []byte, seqno uint64, kind kv.Kind) {
 	n := &node{
 		key:   key,
 		value: value,
-		seqno: seqno,
-		kind:  kind,
 		next:  make([]*node, h),
 	}
 	for i := 0; i < h; i++ {
@@ -80,18 +80,19 @@ func (s *Skiplist) Insert(key, value []byte, seqno uint64, kind kv.Kind) {
 	s.count++
 }
 
-func (s *Skiplist) Get(key []byte) (kv.Entry, bool) {
+// Get returns the value associated with key, if present (exact match).
+func (s *Skiplist) Get(key []byte) ([]byte, bool) {
 	x := s.head
 	for i := s.height - 1; i >= 0; i-- {
-		for x.next[i] != nil && bytes.Compare(x.next[i].key, key) < 0 {
+		for x.next[i] != nil && kv.CompareInternal(x.next[i].key, key) < 0 {
 			x = x.next[i]
 		}
 	}
 	n := x.next[0]
 	if n == nil || !bytes.Equal(n.key, key) {
-		return kv.Entry{}, false
+		return nil, false
 	}
-	return kv.Entry{Key: n.key, Value: n.value, Seqno: n.seqno, Kind: n.kind}, true
+	return n.value, true
 }
 
 func (s *Skiplist) SizeBytes() int64 { return s.sizeBytes }
@@ -109,9 +110,9 @@ func randomHeight() int {
 	return h
 }
 
-// Iterator walks a Skiplist in ascending key order. Created by NewIterator;
-// a fresh iterator is positioned at the first key (Valid() reports whether
-// the source is non-empty).
+// Iterator walks a Skiplist in ascending byte-order. A fresh iterator
+// is positioned at the first key (Valid() reports whether the source is
+// non-empty).
 type Iterator struct {
 	s   *Skiplist
 	cur *node
@@ -120,14 +121,13 @@ type Iterator struct {
 func (it *Iterator) Valid() bool   { return it.cur != nil }
 func (it *Iterator) Key() []byte   { return it.cur.key }
 func (it *Iterator) Value() []byte { return it.cur.value }
-func (it *Iterator) Seqno() uint64 { return it.cur.seqno }
-func (it *Iterator) Kind() kv.Kind { return it.cur.kind }
 func (it *Iterator) Next()         { it.cur = it.cur.next[0] }
 
-func (it *Iterator) Seek(key []byte) {
+// Seek positions the iterator at the first key >= target.
+func (it *Iterator) Seek(target []byte) {
 	x := it.s.head
 	for i := it.s.height - 1; i >= 0; i-- {
-		for x.next[i] != nil && bytes.Compare(x.next[i].key, key) < 0 {
+		for x.next[i] != nil && kv.CompareInternal(x.next[i].key, target) < 0 {
 			x = x.next[i]
 		}
 	}
